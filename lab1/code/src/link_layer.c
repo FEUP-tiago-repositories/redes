@@ -4,7 +4,7 @@
 
 #include "link_layer.h"
 #include "serial_port.h"
-
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -17,6 +17,16 @@
 #define C_SET 0x03
 #define C_UA 0x07
 
+static int alarmCount = 0;
+static int alarmEnabled = FALSE;
+
+static void alarmHandler(int signal)
+{
+    alarmEnabled = TRUE;
+    alarmCount++;
+    printf("Alarm #%d received\n", alarmCount);
+}
+
 static int readFrame(unsigned char addr, unsigned char ctrl)
 {
     enum { S_START, S_FLAG, S_A, S_C, S_BCC, S_END } state = S_START;
@@ -24,9 +34,10 @@ static int readFrame(unsigned char addr, unsigned char ctrl)
 
     while (state != S_END)
     {
+        if (alarmEnabled) return 1;
         int r = readByteSerialPort(&byte);
         if (r < 0)
-            return -1;
+            return alarmEnabled ? 1: -1;
         if (r == 0)
             continue;
 
@@ -99,14 +110,41 @@ int llOpenTx(LinkLayer llParameters)
     // Wait until all bytes have been written to the serial port
     sleep(1);
     */
-    unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
-
-    int bytes = writeBytesSerialPort(set, 5);
-    printf("%d bytes written to serial port (SET)\n", bytes);
-
-    if (readFrame(A_TX, C_UA) < 0)
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
     {
-        perror("readFrame");
+        perror("sigaction");
+        return -1;
+    }
+
+    unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
+    int connected = FALSE;
+    alarmCount = 0;
+
+    while (alarmCount <= llParameters.nRetransmissions && !connected)
+    {
+        int bytes = writeBytesSerialPort(set, 5);
+        printf("%d bytes written to serial port (SET)\n", bytes);
+
+        alarmEnabled = FALSE;
+        alarm(llParameters.timeout);
+        int r = readFrame(A_TX, C_UA);
+        alarm(0);
+
+        if (r < 0)
+        {
+            perror("readFrame");
+            return -1;
+        }
+        if (r == 0)
+            connected = TRUE;
+    }
+
+    if (!connected)
+    {
+        printf("No UA received after %d retransmissions\n", llParameters.nRetransmissions);
+        closeSerialPort();
         return -1;
     }
     printf("UA received\n");
