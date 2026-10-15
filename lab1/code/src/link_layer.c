@@ -17,14 +17,115 @@
 #define C_SET 0x03
 #define C_UA 0x07
 
+// Special byte used for stuffing
+#define ESC 0x7D
+
+// Data frames
+#define C_I0 0x00
+#define C_I1 0x80
+
+// Ready to receive frame 0 or 1
+#define C_RR0 0xAA
+#define C_RR1 0xAB
+
+// Request frame 0 or 1 again
+#define C_REJ0 0x54
+#define C_REJ1 0x55
+
+
 static int alarmCount = 0;
 static int alarmEnabled = FALSE;
+
+// Number of the next frame to send
+static int txSequence = 0;
+
+// Number of the next frame expected
+static int rxSequence = 0;
 
 static void alarmHandler(int signal)
 {
     alarmEnabled = TRUE;
     alarmCount++;
     printf("Alarm #%d received\n", alarmCount);
+}
+
+// Calculate BCC2 from the data bytes
+static unsigned char calculateBCC2(const unsigned char *buf, int size)
+{
+    unsigned char bcc2 = 0;
+
+    for (int i = 0; i < size; i++)
+    {
+        bcc2 = bcc2 ^ buf[i];
+    }
+
+    return bcc2;
+}
+
+// Copy data and replace special bytes
+static int stuffBytes(const unsigned char *buf, int size, unsigned char *stuffed)
+{
+    int j = 0;
+
+    for (int i = 0; i < size; i++)
+    {
+        if (buf[i] == FLAG || buf[i] == ESC)
+        {
+            stuffed[j] = ESC;
+            j++;
+
+            stuffed[j] = buf[i] ^ 0x20;
+            j++;
+        }
+        else
+        {
+            stuffed[j] = buf[i];
+            j++;
+        }
+    }
+
+    return j;
+}
+
+// Build an information frame
+static int buildInformationFrame(const unsigned char *buf, int size,
+                                 unsigned char *frame)
+{
+    unsigned char data[MAX_PAYLOAD_SIZE + 1];
+    unsigned char control;
+
+    // Choose frame number 0 or 1
+    if (txSequence == 0)
+    {
+        control = C_I0;
+    }
+    else
+    {
+        control = C_I1;
+    }
+
+    // Build the header
+    frame[0] = FLAG;
+    frame[1] = A_TX;
+    frame[2] = control;
+    frame[3] = A_TX ^ control;
+
+    // Copy the data
+    for (int i = 0; i < size; i++)
+    {
+        data[i] = buf[i];
+    }
+
+    // Add BCC2 after the data
+    data[size] = calculateBCC2(buf, size);
+
+    // Apply stuffing to the data and BCC2
+    int stuffedSize = stuffBytes(data, size + 1, &frame[4]);
+
+    // Add the final flag
+    frame[4 + stuffedSize] = FLAG;
+
+    return 5 + stuffedSize;
 }
 
 static int readFrame(unsigned char addr, unsigned char ctrl)
@@ -149,16 +250,17 @@ int llOpenTx(LinkLayer llParameters)
     }
     printf("UA received\n");
 
-    // Close serial port
+    /* Close serial port
     if (closeSerialPort() < 0)
     {
         perror("closeSerialPort");
         return -1;
     }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    printf("Serial port %s closed\n", llParameters.serialPort);*/
 
-    return 0;
+    // Keep the port open to send data later.
+    return 0; 
 }
 
 int llOpenRx(LinkLayer llParameters)
@@ -222,7 +324,7 @@ int llOpenRx(LinkLayer llParameters)
     }
     printf("%d bytes written to serial port (UA)\n", bytes);
 
-    sleep(1);
+    /*sleep(1);
 
     // Close serial port
     if (closeSerialPort() < 0)
@@ -231,8 +333,9 @@ int llOpenRx(LinkLayer llParameters)
         return -1;
     }
 
-    printf("Serial port %s closed\n", llParameters.serialPort);
+    printf("Serial port %s closed\n", llParameters.serialPort);*/
 
+    // Keep the port open to receive data later.
     return 0;
 }
 
