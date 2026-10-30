@@ -92,6 +92,47 @@ static int stuffBytes(const unsigned char *buf, int size, unsigned char *stuffed
     return j;
 }
 
+// Restore the original data bytes.
+static int destuffBytes(const unsigned char *buf, int size,
+                        unsigned char *data)
+{
+    int j = 0;
+
+    for (int i = 0; i < size; i++)
+    {
+        unsigned char byte = buf[i];
+
+        if (byte == ESC)
+        {
+            i++;
+
+            // ESC must be followed by a valid byte.
+            if (i >= size)
+            {
+                return -1;
+            }
+
+            if (buf[i] != 0x5E && buf[i] != 0x5D)
+            {
+                return -1;
+            }
+
+            byte = buf[i] ^ 0x20;
+        }
+
+        // Allow data bytes and one BCC2 byte.
+        if (j >= MAX_PAYLOAD_SIZE + 1)
+        {
+            return -1;
+        }
+
+        data[j] = byte;
+        j++;
+    }
+
+    return j;
+}
+
 // Build an information frame
 static int buildInformationFrame(const unsigned char *buf, int size,
                                  unsigned char *frame)
@@ -179,6 +220,72 @@ static int readFrame(unsigned char addr, unsigned char ctrl)
     return 0;
 }
 
+static int readControl(unsigned char addr)
+{
+    enum { START, FLAG_RCV, A_RCV, C_RCV, BCC_OK } state = START;
+    unsigned char byte, c = 0;
+
+    while (1)
+    {
+        if (alarmEnabled) return -2;
+        int r = readByteSerialPort(&byte);
+        if (r < 0) return alarmEnabled ? -2 : -1;
+        if (r == 0) continue;
+
+        switch (state)
+        {
+            case START:
+                if (byte == FLAG) state = FLAG_RCV;
+                break;
+            case FLAG_RCV:
+                if (byte == addr) state = A_RCV;
+                else if (byte != FLAG) state = START;
+                break;
+            case A_RCV:
+                if (byte == FLAG) state = FLAG_RCV;
+                else { c = byte; state = C_RCV; }
+                break;
+            case C_RCV:
+                if (byte == (addr ^ c)) state = BCC_OK;
+                else if (byte == FLAG) state = FLAG_RCV;
+                else state = START;
+                break;
+            case BCC_OK:
+                if (byte == FLAG) return c;
+                state = START;
+                break;
+        }
+    }
+}
+
+// Send a control frame.
+static int sendControl(unsigned char addr, unsigned char control)
+{
+    unsigned char frame[5] = {
+        FLAG,
+        addr,
+        control,
+        addr ^ control,
+        FLAG
+    };
+
+    int sent = 0;
+
+    while (sent < 5)
+    {
+        int bytes = writeBytesSerialPort(&frame[sent], 5 - sent);
+
+        if (bytes <= 0)
+        {
+            return -1;
+        }
+
+        sent = sent + bytes;
+    }
+
+    return 0;
+}
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -198,44 +305,6 @@ int llOpenTx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
-
-    static int readControl(unsigned char addr)
-    {
-        enum { START, FLAG_RCV, A_RCV, C_RCV, BCC_OK } state = START;
-        unsigned char byte, c = 0;
-
-        while (1)
-        {
-            if (alarmEnabled) return -2;
-            int r = readByteSerialPort(&byte);
-            if (r < 0) return alarmEnabled ? -2 : -1;
-            if (r == 0) continue;
-
-            switch (state)
-            {
-                case START:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    break;
-                case FLAG_RCV:
-                    if (byte == addr) state = A_RCV;
-                    else if (byte != FLAG) state = START;
-                    break;
-                case A_RCV:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    else { c = byte; state = C_RCV; }
-                    break;
-                case C_RCV:
-                    if (byte == (addr ^ c)) state = BCC_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break;
-                case BCC_OK:
-                    if (byte == FLAG) return c;
-                    state = START;
-                    break;
-            }
-        }
-    }
 
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
@@ -282,10 +351,12 @@ int llOpenTx(LinkLayer llParameters)
 
 int llOpenRx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and receive a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
+    // Save connection settings.
+    params = llParameters;
+
+    // Start by expecting frame 0.
+    rxSequence = 0;
+    alarmEnabled = FALSE;
 
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
@@ -294,6 +365,17 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
+
+    // Set up the alarm handler.
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        closeSerialPort();
+        return -1;
+    }
 
     if (readFrame(A_TX, C_SET) < 0)
     {
@@ -352,9 +434,210 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
-    // TODO: Implement this function
+    enum { START, FLAG_RCV, A_RCV, C_RCV, DATA_RCV } state = START;
 
-    return 0;
+    unsigned char byte;
+    unsigned char control = 0;
+    unsigned char stuffed[2 * (MAX_PAYLOAD_SIZE + 1)];
+    unsigned char data[MAX_PAYLOAD_SIZE + 1];
+
+    int size = 0;
+    int tooLarge = FALSE;
+
+    while (1)
+    {
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes < 0)
+        {
+            return -1;
+        }
+
+        if (bytes == 0)
+        {
+            continue;
+        }
+
+        switch (state)
+        {
+            case START:
+                if (byte == FLAG)
+                {
+                    state = FLAG_RCV;
+                }
+                break;
+
+            case FLAG_RCV:
+                if (byte == A_TX)
+                {
+                    state = A_RCV;
+                }
+                else if (byte != FLAG)
+                {
+                    state = START;
+                }
+                break;
+
+            case A_RCV:
+                // Accept information frames or a repeated SET.
+                if (byte == C_I0 || byte == C_I1 || byte == C_SET)
+                {
+                    control = byte;
+                    state = C_RCV;
+                }
+                else if (byte == FLAG)
+                {
+                    state = FLAG_RCV;
+                }
+                else
+                {
+                    state = START;
+                }
+                break;
+
+            case C_RCV:
+                // Check BCC1.
+                if (byte == (A_TX ^ control))
+                {
+                    size = 0;
+                    tooLarge = FALSE;
+                    state = DATA_RCV;
+                }
+                else if (byte == FLAG)
+                {
+                    state = FLAG_RCV;
+                }
+                else
+                {
+                    state = START;
+                }
+                break;
+
+            case DATA_RCV:
+            {
+                if (byte != FLAG)
+                {
+                    // Store bytes until the final flag.
+                    if (size < (int)sizeof(stuffed))
+                    {
+                        stuffed[size] = byte;
+                        size++;
+                    }
+                    else
+                    {
+                        tooLarge = TRUE;
+                    }
+
+                    break;
+                }
+
+                // This flag can also start the next frame.
+                state = FLAG_RCV;
+
+                // Reply again if the first UA was lost.
+                if (control == C_SET)
+                {
+                    if (size == 0 && !tooLarge)
+                    {
+                        if (sendControl(A_TX, C_UA) < 0)
+                        {
+                            return -1;
+                        }
+                    }
+
+                    break;
+                }
+
+                int sequence = 0;
+
+                if (control == C_I1)
+                {
+                    sequence = 1;
+                }
+
+                unsigned char rr;
+                unsigned char rej;
+
+                if (rxSequence == 0)
+                {
+                    rr = C_RR0;
+                    rej = C_REJ0;
+                }
+                else
+                {
+                    rr = C_RR1;
+                    rej = C_REJ1;
+                }
+
+                // Confirm duplicates without delivering them again.
+                if (sequence != rxSequence)
+                {
+                    if (sendControl(A_TX, rr) < 0)
+                    {
+                        return -1;
+                    }
+
+                    break;
+                }
+
+                int dataSize = -1;
+
+                if (!tooLarge)
+                {
+                    dataSize = destuffBytes(stuffed, size, data);
+                }
+
+                // The last byte is BCC2.
+                if (dataSize < 1)
+                {
+                    if (sendControl(A_TX, rej) < 0)
+                    {
+                        return -1;
+                    }
+
+                    break;
+                }
+
+                int packetSize = dataSize - 1;
+                unsigned char bcc2 = calculateBCC2(data, packetSize);
+
+                if (bcc2 != data[packetSize])
+                {
+                    if (sendControl(A_TX, rej) < 0)
+                    {
+                        return -1;
+                    }
+
+                    break;
+                }
+
+                // Copy only the packet, without BCC2.
+                for (int i = 0; i < packetSize; i++)
+                {
+                    packet[i] = data[i];
+                }
+
+                // Expect the other frame number next.
+                rxSequence = 1 - rxSequence;
+
+                if (rxSequence == 0)
+                {
+                    rr = C_RR0;
+                }
+                else
+                {
+                    rr = C_RR1;
+                }
+
+                if (sendControl(A_TX, rr) < 0)
+                {
+                    return -1;
+                }
+
+                return packetSize;
+            }
+        }
+    }
 }
 
 ////////////////////////////////////////////////
@@ -390,7 +673,59 @@ int llCloseTx()
 
 int llCloseRx()
 {
-    // TODO: Implement this function
+    alarmEnabled = FALSE;
+
+    // Wait for DISC from the transmitter.
+    if (readFrame(A_TX, C_DISC) != 0)
+    {
+        closeSerialPort();
+        return -1;
+    }
+
+    printf("DISC received\n");
+
+    int ok = FALSE;
+
+    for (int tries = 0; tries <= params.nRetransmissions; tries++)
+    {
+        // Send DISC to the transmitter.
+        if (sendControl(A_RX, C_DISC) < 0)
+        {
+            break;
+        }
+
+        // Wait for UA with a timeout.
+        alarmEnabled = FALSE;
+        alarm(params.timeout);
+
+        int control = readControl(A_RX);
+
+        alarm(0);
+
+        if (control == C_UA)
+        {
+            ok = TRUE;
+            break;
+        }
+
+        if (control == -1)
+        {
+            break;
+        }
+    }
+
+    if (closeSerialPort() < 0)
+    {
+        return -1;
+    }
+
+    if (!ok)
+    {
+        printf("Connection close failed\n");
+        return -1;
+    }
+
+    printf("Connection closed\n");
 
     return 0;
 }
